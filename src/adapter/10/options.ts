@@ -181,6 +181,14 @@ export function setupOptionsV10(
 	};
 
 	const userRootToContainer = new Map<VNode, Node>();
+	const userRootToParent = new Map<VNode, unknown>();
+	const parentToRoot = new Map<unknown, VNode>();
+	const renderParentStack: Node[] = [];
+	const resolveContainerDom = (parent: Node): Node | null =>
+		lynx.preactDevtoolsCtx.Node && parent instanceof lynx.preactDevtoolsCtx.Node
+			? parent
+			: ((parent as any).parentNode ?? null);
+
 	o._commit = o.__c = (vnode: VNode | null, queue: any[]) => {
 		if (prevCommitRoot) prevCommitRoot(vnode, queue);
 
@@ -188,11 +196,40 @@ export function setupOptionsV10(
 		if (vnode == null) return;
 		if (isRoot(vnode, config)) {
 			const children = getActualChildren(vnode);
+			let dom: Node | null | undefined;
+			let parent: unknown;
 			if (children.length > 0) {
-				const dom = userRootToContainer.get(children[0] as any);
-				if (dom) {
-					roots.set(vnode, dom);
+				const child = children[0] as any;
+				dom = userRootToContainer.get(child);
+				parent = userRootToParent.get(child);
+			}
+			// When a user root VNode is re-passed to `render(vnode, parent)` (or
+			// shallow-cloned with `_depth > 0` by `runWithForceRootRender`), Preact's
+			// `constructNewChildrenArray` clones the in-use VNode so `children[0]`
+			// is a fresh VNode instance rather than the one passed to `_root`.
+			// Match `vnode` against the active `render()` container stack.
+			for (let i = renderParentStack.length - 1; i >= 0; i--) {
+				const candidate = renderParentStack[i];
+				if (
+					((candidate as any)._children as VNode | undefined) === vnode ||
+					((candidate as any).__k as VNode | undefined) === vnode
+				) {
+					renderParentStack.splice(i, 1);
+					if (!dom) {
+						parent = candidate;
+						dom = resolveContainerDom(candidate);
+					}
+					break;
 				}
+			}
+			if (dom) {
+				const containerKey = parent ?? dom;
+				const prevRootVNode = parentToRoot.get(containerKey);
+				if (prevRootVNode && prevRootVNode !== vnode) {
+					roots.delete(prevRootVNode);
+				}
+				parentToRoot.set(containerKey, vnode);
+				roots.set(vnode, dom);
 			}
 		}
 
@@ -205,25 +242,45 @@ export function setupOptionsV10(
 	o._root = o.__ = (vnode: VNode, parent: Node | null) => {
 		if (parent === null) {
 			userRootToContainer.delete(vnode);
+			userRootToParent.delete(vnode);
 		} else {
-			// Some islands based frameworks use a virtual container node
-			// instead of an actual DOM node.
-			//
-			// On a browser host `lynx.preactDevtoolsCtx.Node === window.Node`. On
-			// ReactLynx, `setup.ts` shims `lynx.preactDevtoolsCtx.Node` with the
-			// `BackgroundSnapshotInstance` constructor (`__root.__proto__.constructor`)
-			// so the shim is always defined when this hook fires. Guarding on
-			// `"Node" in globalThis` would always be false in the ReactLynx
-			// Background VM, forcing the islands fallback below and producing
-			// `treeParent = parent.parentNode === null` for the top-level
-			// `__root`. That kept `roots` empty and broke `refresh` /
-			// `getRootMappings`. Compare against the shim instead.
-			const treeParent =
-				lynx.preactDevtoolsCtx.Node &&
-				parent instanceof lynx.preactDevtoolsCtx.Node
-					? parent
-					: (parent as any).parentNode;
-			userRootToContainer.set(vnode, treeParent);
+			// Re-rendering into an existing container (including ReactLynx
+			// `runWithForceRootRender` cloning `__root.__jsx`) allocates a fresh
+			// synthetic Fragment root and overwrites `parent._children` without
+			// unmounting the previous Fragment root. Evict the prior root now so
+			// `onCommit` / `refresh` never walk a detached stale snapshot.
+			const prevRootVNode =
+				((parent as any)._children as VNode | undefined) ??
+				((parent as any).__k as VNode | undefined) ??
+				parentToRoot.get(parent);
+			if (prevRootVNode) {
+				roots.delete(prevRootVNode);
+				parentToRoot.delete(parent);
+				if (vnode == null) {
+					renderer.onUnmount(prevRootVNode as any);
+				}
+			}
+
+			if (vnode != null) {
+				// Some islands based frameworks use a virtual container node
+				// instead of an actual DOM node.
+				//
+				// On a browser host `lynx.preactDevtoolsCtx.Node === window.Node`. On
+				// ReactLynx, `setup.ts` shims `lynx.preactDevtoolsCtx.Node` with the
+				// `BackgroundSnapshotInstance` constructor (`__root.__proto__.constructor`)
+				// so the shim is always defined when this hook fires. Guarding on
+				// `"Node" in globalThis` would always be false in the ReactLynx
+				// Background VM, forcing the islands fallback below and producing
+				// `treeParent = parent.parentNode === null` for the top-level
+				// `__root`. That kept `roots` empty and broke `refresh` /
+				// `getRootMappings`. Compare against the shim instead.
+				const treeParent = resolveContainerDom(parent);
+				if (treeParent) {
+					userRootToContainer.set(vnode, treeParent);
+				}
+				userRootToParent.set(vnode, parent);
+				renderParentStack.push(parent);
+			}
 		}
 
 		if (prevRoot) prevRoot(vnode, parent);
@@ -243,8 +300,10 @@ export function setupOptionsV10(
 	return () => {
 		options.unmount = prevBeforeUnmount;
 		o._commit = o.__c = prevCommitRoot;
+		o._root = o.__ = prevRoot;
 		options.diffed = prevAfterDiff;
 		o._diff = o.__b = prevBeforeDiff;
+		o._render = o.__r = prevRender;
 		options.vnode = prevVNodeHook;
 		o._hook = o.__h = prevHook;
 		options.useDebugValue = prevUseDebugValue;
